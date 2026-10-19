@@ -1,0 +1,4 @@
+creds*.json
+bridge.log
+bridge.pid
+__pycache__
