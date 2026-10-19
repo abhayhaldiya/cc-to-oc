@@ -12,6 +12,8 @@
 #   ./run.sh --port=<n>           # bind port (default 8738)
 #   ./run.sh --secret=<str>       # bridge secret (default: auto-generated)
 #   ./run.sh --smooth             # enable text streaming smoothing (default OFF)
+#   ./run.sh --refresh            # pre-flight refresh of stale creds before start
+#   ./run.sh --no-refresh         # skip pre-flight refresh (default; rely on in-bridge self-heal)
 #
 # Creds: put creds*.json in ./creds/  (or set CREDS_DIR=/path/to/dir).
 # The script is fully self-contained; move this folder anywhere and it still works.
@@ -27,6 +29,7 @@ ACTION="start"
 DO_BACKGROUND=0
 DO_RESTART=0
 DO_SMOOTH=0
+DO_REFRESH=0
 SECRET=""
 PORT=8738
 
@@ -39,6 +42,8 @@ for arg in "$@"; do
     --check)           ACTION="check" ;;
     --restart)         DO_RESTART=1 ;;
     --smooth)          DO_SMOOTH=1 ;;
+    --refresh)         DO_REFRESH=1 ;;
+    --no-refresh)      DO_REFRESH=0 ;;
     --port=*)          PORT="${arg#--port=}" ;;
     --secret=*)        SECRET="${arg#--secret=}" ;;
     -h|--help)
@@ -101,6 +106,113 @@ if [ -n "$EXISTING" ]; then
     echo "❌ bridge already running on port $PORT (PID $EXISTING). Use --restart or --stop." >&2
     exit 1
   fi
+fi
+
+if [ "$DO_REFRESH" -eq 1 ]; then
+  echo "── Startup refresh: retry+backoff on stale creds in $CREDS_DIR ──"
+  CREDS_DIR="$CREDS_DIR" "$VPY" <<'PY'
+import glob, json, os, sys, time
+
+try:
+    from curl_cffi import requests as cf
+except ImportError:
+    print("  ⚠️  curl_cffi not installed; skipping refresh (pip install curl_cffi)")
+    sys.exit(0)
+
+CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+URL = "https://api.anthropic.com/v1/oauth/token"
+MAX_ATTEMPTS = 3
+BACKOFF_S = 30.0
+FRESH_HEADROOM_S = 600
+UA = "claude-cli/2.0.170 (external, cli)"
+BETA = "oauth-2025-04-20,claude-code-20250219"
+CREDS_DIR = os.environ.get("CREDS_DIR", "creds")
+
+def refresh_one(path):
+    with open(path) as fh:
+        d = json.load(fh)
+    oauth = d.get("claudeAiOauth", {})
+    rt = oauth.get("refreshToken", "")
+    exp_ms = int(oauth.get("expiresAt", 0))
+
+    if exp_ms > (time.time() + FRESH_HEADROOM_S) * 1000:
+        ttl = (exp_ms - int(time.time() * 1000)) // 1000
+        return ("FRESH", f"TTL {ttl}s (~{ttl/3600:.1f}h)")
+    if not rt:
+        return ("BROKEN", "no refresh_token")
+
+    last_err = None
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            r = cf.post(
+                URL,
+                json={"grant_type": "refresh_token", "refresh_token": rt, "client_id": CLIENT_ID},
+                headers={
+                    "Content-Type": "application/json",
+                    "anthropic-beta": BETA,
+                    "User-Agent": UA,
+                },
+                impersonate="chrome124",
+                timeout=20,
+            )
+        except Exception as e:
+            last_err = f"network: {e}"
+            if attempt < MAX_ATTEMPTS:
+                time.sleep(BACKOFF_S)
+            continue
+
+        if r.status_code == 200:
+            data = r.json()
+            oauth["accessToken"] = data["access_token"]
+            oauth["refreshToken"] = data.get("refresh_token", rt)
+            oauth["expiresAt"] = int((time.time() + int(data.get("expires_in", 28800))) * 1000)
+            d["claudeAiOauth"] = oauth
+            tmp = path + ".tmp"
+            with open(tmp, "w") as fh:
+                json.dump(d, fh, indent=2)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, path)
+            return ("REFRESHED", f"new TTL {int(data.get('expires_in', 0))}s (~{int(data.get('expires_in', 0))/3600:.1f}h)")
+
+        last_err = f"HTTP {r.status_code}"
+        if r.status_code == 429 and attempt < MAX_ATTEMPTS:
+            time.sleep(BACKOFF_S)
+            continue
+        if 400 <= r.status_code < 500 and r.status_code != 429:
+            return ("DEAD_OAUTH", last_err)
+        if attempt < MAX_ATTEMPTS:
+            time.sleep(BACKOFF_S)
+
+    return ("BROKEN", last_err or "unknown")
+
+files = sorted(f for f in glob.glob(os.path.join(CREDS_DIR, "creds*.json"))
+               if "backup" not in f and "dead" not in f and ".tmp" not in f)
+if not files:
+    print("  no cred files found")
+    sys.exit(0)
+
+results = []
+for f in files:
+    label = os.path.basename(f)
+    print(f"  {label}: refreshing ...", end="", flush=True)
+    state, msg = refresh_one(f)
+    icon = {"FRESH": "🟢", "REFRESHED": "✅", "DEAD_OAUTH": "🔴", "BROKEN": "⚠️"}.get(state, "❓")
+    print(f"\r  {label}: {icon} {state:10s}  {msg}                                ")
+    results.append(state)
+
+fresh = sum(1 for s in results if s in ("FRESH", "REFRESHED"))
+dead = sum(1 for s in results if s == "DEAD_OAUTH")
+broken = sum(1 for s in results if s == "BROKEN")
+print()
+print(f"  Summary: {fresh} live, {broken} temp-broken (rate-limited, will heal), {dead} dead (need recapture)")
+if dead > 0:
+    print(f"  ⚠️  {dead} cred(s) need re-capture via: claude login && security find-generic-password -s 'Claude Code-credentials' -w > {os.path.join(CREDS_DIR, 'credsN.json')}")
+if fresh == 0 and broken > 0:
+    print(f"  ℹ️  Bridge will start anyway. In-bridge self-heal retries every 30s on requests.")
+elif fresh == 0 and dead == len(files):
+    print(f"  ❌ ALL creds dead. Bridge will start but ALL requests will fail 401 until you re-capture.")
+PY
+  echo ""
 fi
 
 # Build the creds pool from CREDS_DIR
